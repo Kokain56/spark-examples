@@ -3,7 +3,6 @@ package spark.dataset
 import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
 
-
 object DatasetExample extends App {
   final case class AIJobIndustry(
                                   jobTitle: String,
@@ -48,12 +47,12 @@ object DatasetExample extends App {
   val parsingAiJobsIndustryDF = aiJobsIndustryDF.transform(parsing)
 
   val jobsDF = parsingAiJobsIndustryDF
-    .transform(getJobDF)
-    .transform(processingDF)
+    .transform(getJobOrCompanyDF(DfColumn.JobTitle))
+    .transform(getMaxAndMinDF)
 
   val companyDF = parsingAiJobsIndustryDF
-    .transform(getCompanyDF)
-    .transform(processingDF)
+    .transform(getJobOrCompanyDF(DfColumn.Company))
+    .transform(getMaxAndMinDF)
 
   val unionJobsAndCompanyDF = jobsDF.union((companyDF)) // finalDF
 
@@ -66,10 +65,10 @@ object DatasetExample extends App {
   val aiJobIndustryDS = aiJobsIndustryDF.as[AIJobIndustry]
   val parsingAIJobIndustryDS = aiJobIndustryDS.transform(parsingDS)
 
-  val maxJob = getMaxJob(parsingAIJobIndustryDS)
+  val maxJob = getMax("job")(parsingAIJobIndustryDS)
 
   val maxJobReviewsDS = parsingAIJobIndustryDS
-    .transform(getMaxJobReviews)
+    .transform(getMaxReviews("job", maxJob.name))
 
   val maxJobLocationDS = maxJobReviewsDS
     .transform(getMaxLocation)
@@ -79,10 +78,10 @@ object DatasetExample extends App {
 
   val jobDS = maxJobLocationDS.union(minJobLocationDS)
 
-  val maxCompany = getMaxCompany(parsingAIJobIndustryDS)
+  val maxCompany = getMax("company")(parsingAIJobIndustryDS)
 
   val maxCompanyReviewsDS = parsingAIJobIndustryDS
-    .transform(getMaxCompanyReviews)
+    .transform(getMaxReviews("company", maxCompany.name))
 
   val maxCompanyLocationDS = maxCompanyReviewsDS
     .transform(getMaxLocation)
@@ -107,8 +106,14 @@ object DatasetExample extends App {
         AIJobIndustry(x.jobTitle, company, x.location, companyReviews)
       }.filter(col(DfColumn.Company).notEqual("") && col(DfColumn.CompanyReviews).notEqual(""))
 
-  def getMaxCompany(ds: Dataset[AIJobIndustry]): NameWithCount =
-    ds.groupByKey(_.company).mapGroups(
+  def getRecord(rec: AIJobIndustry, recType: String) =
+    recType match {
+      case "job" => rec.jobTitle
+      case _ => rec.company
+    }
+
+  def getMax(recType: String)(ds: Dataset[AIJobIndustry]): NameWithCount =
+    ds.groupByKey(getRecord(_, recType)).mapGroups(
       (name, aiJobIndustry) => {
         val count = aiJobIndustry
           .map(x => if (x.companyReviews.nonEmpty) x.companyReviews.toInt else 0)
@@ -117,35 +122,14 @@ object DatasetExample extends App {
       }
     ).orderBy(desc(DfColumn.Count)).head()
 
-  def getMaxJob(ds: Dataset[AIJobIndustry]): NameWithCount =
-    ds.groupByKey(_.jobTitle).mapGroups(
-      (name, aiJobIndustry) => {
-        val count = aiJobIndustry
-          .map(x => if (x.companyReviews.nonEmpty) x.companyReviews.toInt else 0)
-          .reduce((a, b) => a + b)
-        NameWithCount(name, count)
-      }
-    ).orderBy(desc(DfColumn.Count)).head()
-
-  def getMaxJobReviews(ds: Dataset[AIJobIndustry]): Dataset[NameWithLocation] =
+  def getMaxReviews(recType: String, maxValue: String)(ds: Dataset[AIJobIndustry]): Dataset[NameWithLocation] =
     ds
-      .filter(x => x.jobTitle.equals(maxJob.name)).groupByKey(x => (x.jobTitle, x.location)).mapGroups(
+      .filter(x => getRecord(x, recType).equals(maxValue)).groupByKey(x => (getRecord(x, recType), x.location)).mapGroups(
         (jobAndLocation, aiJobIndustry) => {
           val count = aiJobIndustry
             .map(x => if (x.companyReviews.nonEmpty) x.companyReviews.toInt else 0)
             .reduce((a, b) => a + b)
           NameWithLocation(jobAndLocation._1, "job", jobAndLocation._2, count)
-        }
-      )
-
-  def getMaxCompanyReviews(ds: Dataset[AIJobIndustry]): Dataset[NameWithLocation] =
-    ds
-      .filter(x => x.company.equals(maxCompany.name)).groupByKey(x => (x.company, x.location)).mapGroups(
-        (companyAndLocation, aiJobIndustry) => {
-          val count = aiJobIndustry
-            .map(x => if (x.companyReviews.nonEmpty) x.companyReviews.toInt else 0)
-            .reduce((a, b) => a + b)
-          NameWithLocation(companyAndLocation._1, "company", companyAndLocation._2, count)
         }
       )
 
@@ -171,55 +155,61 @@ object DatasetExample extends App {
         }
       )
 
-  def processingDF(df: DataFrame): DataFrame = {
+  def getMaxAndMinDF(df: DataFrame): DataFrame = {
+    val maxDF = getMaxDF(df).withColumn(DfColumn.CountType, lit("max"))
 
-    val minAndMaxLocationDS = df
-      .groupBy(DfColumn.name, DfColumn.StatsType, DfColumn.Location)
-      .agg(sum(col(DfColumn.Reviews)).as(DfColumn.Reviews))
-      .groupBy(DfColumn.name, DfColumn.StatsType)
-      .agg(
-        sum(col(DfColumn.Reviews)).as(DfColumn.Count),
-        min_by(col(DfColumn.Location), col(DfColumn.Reviews)).as(DfColumn.LocationMin),
-        max_by(col(DfColumn.Location), col(DfColumn.Reviews)).as(DfColumn.LocationMax),
-        min(col(DfColumn.Reviews)).as(DfColumn.ReviewsMin),
-        max(col(DfColumn.Reviews)).as(DfColumn.ReviewsMax)
-      )
-      .orderBy(desc(DfColumn.Count))
-      .limit(1)
+    val minDF = getMinDF(df).withColumn(DfColumn.CountType, lit("min"))
 
-    minAndMaxLocationDS.select(
-      col(DfColumn.name),
+    val union = maxDF.union(minDF)
+    union.select(
+      col(DfColumn.Name),
       col(DfColumn.StatsType),
-      col(DfColumn.LocationMin).as(DfColumn.Location),
-      col(DfColumn.ReviewsMin).as(DfColumn.Count),
-      lit("min").as(DfColumn.CountType)
-    ).union(
-      minAndMaxLocationDS.select(
-        col(DfColumn.name),
-        col(DfColumn.StatsType),
-        col(DfColumn.LocationMax).as(DfColumn.Location),
-        col(DfColumn.ReviewsMax).as(DfColumn.Count),
-        lit("max").as(DfColumn.CountType)
-      )
+      col(DfColumn.Location).as(DfColumn.Location),
+      col(DfColumn.Reviews).as(DfColumn.Count),
+      col(DfColumn.CountType)
     )
   }
 
-  def getJobDF(df: DataFrame): DataFrame =
-    df
-      .select(
-        col(DfColumn.JobTitle).as(DfColumn.name),
-        col(DfColumn.Location).as(DfColumn.Location),
-        col(DfColumn.CompanyReviews).cast("int").as(DfColumn.Reviews),
-      ).withColumn(DfColumn.StatsType, lit("job"))
 
-  def getCompanyDF(df: DataFrame): DataFrame =
+  def getMaxDF(df: DataFrame): DataFrame = df
+    .groupBy(DfColumn.Name, DfColumn.StatsType, DfColumn.Location)
+    .agg(sum(col(DfColumn.Reviews)).as(DfColumn.Reviews))
+    .groupBy(DfColumn.Name, DfColumn.StatsType)
+    .agg(
+      sum(col(DfColumn.Reviews)).as(DfColumn.Count),
+      max_by(col(DfColumn.Location), col(DfColumn.Reviews)).as(DfColumn.Location),
+      max(col(DfColumn.Reviews)).as(DfColumn.Reviews)
+    )
+    .orderBy(desc(DfColumn.Count))
+    .limit(1)
+
+  def getMinDF(df: DataFrame): DataFrame = df
+    .groupBy(DfColumn.Name, DfColumn.StatsType, DfColumn.Location)
+    .agg(sum(col(DfColumn.Reviews)).as(DfColumn.Reviews))
+    .groupBy(DfColumn.Name, DfColumn.StatsType)
+    .agg(
+      sum(col(DfColumn.Reviews)).as(DfColumn.Count),
+      min_by(col(DfColumn.Location), col(DfColumn.Reviews)).as(DfColumn.Location),
+      min(col(DfColumn.Reviews)).as(DfColumn.Reviews)
+    )
+    .orderBy(desc(DfColumn.Count))
+    .limit(1)
+
+  def getJobOrCompanyDF(nameColumn: DfColumn.Value)(df: DataFrame): DataFrame =
     df
       .select(
-        col(DfColumn.Company).as(DfColumn.name),
+        col(nameColumn).as(DfColumn.Name),
         col(DfColumn.Location).as(DfColumn.Location),
         col(DfColumn.CompanyReviews).cast("int").as(DfColumn.Reviews),
-      ).withColumn(DfColumn.StatsType, lit("company"))
-      .where(col(DfColumn.name).notEqual(""))
+      ).transform(withColumnDF(nameColumn))
+
+  def withColumnDF(nameColumn: DfColumn.Value)(df: DataFrame): DataFrame = {
+    val stringNameColumn = nameColumn match {
+      case DfColumn.JobTitle => "job"
+      case _ => "company"
+    }
+    df.withColumn(DfColumn.StatsType, lit(stringNameColumn))
+  }
 
   def parsing(df: DataFrame): DataFrame =
     df
@@ -237,17 +227,13 @@ object DatasetExample extends App {
   }
 
   trait DfColumn extends Enumeration {
-    val name,
+    val Name,
     Company,
     Count,
     CountType,
     JobTitle,
     Location,
-    LocationMax,
-    LocationMin,
     Reviews,
-    ReviewsMax,
-    ReviewsMin,
     StatsType,
     CompanyReviews = Value
   }
